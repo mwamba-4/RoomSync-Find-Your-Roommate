@@ -123,25 +123,146 @@ app.put('/api/profile', requireAuth, (req, res) => {
   res.json({ message: 'Profile saved.', profile: profileQuery.get(req.session.userId) });
  } catch (err) { res.status(400).json({ error: err.message || 'Invalid profile.' }); }
 });
-function compatibility(a,b) {
- let score = 25 * Math.max(0, 1 - Math.abs(a.budget-b.budget)/25000);
- score += 15 * (a.area && b.area.toLowerCase() === a.area.toLowerCase() ? 1 : .5);
- score += 15 * (a.sleep === b.sleep ? 1 : (a.sleep === 'flex' || b.sleep === 'flex' ? .65 : 0));
- for (const k of ['tidy','smokingOk','guestsOk','petsOk']) score += 11.25 * (a[k] === b[k] ? 1 : 0);
- return Math.round(score);
+
+function compatibility(a, b) {
+    let score = 0;
+    const reasons = [];
+
+    // 1. Budget compatibility: 30 points
+    const budgetDifference = Math.abs(a.budget - b.budget);
+    const averageBudget = (a.budget + b.budget) / 2;
+    const budgetTolerance = Math.max(8000, averageBudget * 0.5);
+
+    const budgetScore = 30 * Math.max(
+        0,
+        1 - budgetDifference / budgetTolerance
+    );
+
+    score += budgetScore;
+
+    if (budgetScore >= 24) {
+        reasons.push("Very similar monthly budgets");
+    } else if (budgetScore >= 15) {
+        reasons.push("Reasonably compatible budgets");
+    }
+
+    // 2. Preferred neighbourhood: 20 points
+    if (
+        a.area &&
+        b.area &&
+        a.area.trim().toLowerCase() === b.area.trim().toLowerCase()
+    ) {
+        score += 20;
+        reasons.push("Same preferred neighbourhood");
+    } else if (!a.area || !b.area) {
+        score += 10;
+    } else {
+        score += 8;
+    }
+
+    // 3. Sleep schedules: 15 points
+    if (a.sleep === b.sleep) {
+        score += 15;
+        reasons.push("Matching sleep schedules");
+    } else if (a.sleep === "flex" || b.sleep === "flex") {
+        score += 10;
+        reasons.push("Some flexibility in sleep schedules");
+    }
+
+    // 4. Cleanliness: 10 points
+    if (a.tidy === b.tidy) {
+        score += 10;
+        reasons.push("Similar cleanliness preferences");
+    }
+
+    // 5. Smoking preferences: 10 points
+    if (a.smokingOk === b.smokingOk) {
+        score += 10;
+        reasons.push("Matching smoking preferences");
+    }
+
+    // 6. Guests: 7.5 points
+    if (a.guestsOk === b.guestsOk) {
+        score += 7.5;
+        reasons.push("Similar preferences about guests");
+    }
+
+    // 7. Pets: 7.5 points
+    if (a.petsOk === b.petsOk) {
+        score += 7.5;
+        reasons.push("Matching pet preferences");
+    }
+
+    return {
+        score: Math.round(score),
+        reasons
+    };
 }
-app.get('/api/matches', requireAuth, (req,res) => {
- const me = profileQuery.get(req.session.userId);
- if (!me) return res.status(400).json({ error: 'Complete your profile first.' });
- // Gender equality is enforced by this server-side SQL filter, not trusted to the browser.
- const rows = db.prepare(`SELECT user_id AS id,display_name AS displayName,age,gender,city,area,budget,sleep,
- tidy,smoking_ok AS smokingOk,guests_ok AS guestsOk,pets_ok AS petsOk,about FROM profiles
- WHERE user_id != ? AND gender = ? AND lower(city)=lower(?)
- AND user_id NOT IN (SELECT reported_user_id FROM reports WHERE reporter_id=?)
- AND user_id NOT IN (SELECT reporter_id FROM reports WHERE reported_user_id=?)`)
- .all(req.session.userId, me.gender, me.city, req.session.userId, req.session.userId);
- res.json({ matches: rows.map(p => ({ ...p, score: compatibility(me,p) })).sort((a,b) => b.score-a.score) });
+
+
+app.get('/api/matches', requireAuth, (req, res) => {
+    const me = profileQuery.get(req.session.userId);
+
+    if (!me) {
+        return res.status(400).json({
+            error: 'Complete your profile first.'
+        });
+    }
+
+    const rows = db.prepare(`
+        SELECT
+            user_id AS id,
+            display_name AS displayName,
+            age,
+            gender,
+            city,
+            area,
+            budget,
+            sleep,
+            tidy,
+            smoking_ok AS smokingOk,
+            guests_ok AS guestsOk,
+            pets_ok AS petsOk,
+            about
+        FROM profiles
+        WHERE user_id != ?
+          AND gender = ?
+          AND lower(trim(city)) = lower(trim(?))
+
+          AND user_id NOT IN (
+              SELECT reported_user_id
+              FROM reports
+              WHERE reporter_id = ?
+          )
+
+          AND user_id NOT IN (
+              SELECT reporter_id
+              FROM reports
+              WHERE reported_user_id = ?
+          )
+    `).all(
+        req.session.userId,
+        me.gender,
+        me.city,
+        req.session.userId,
+        req.session.userId
+    );
+
+    const matches = rows.map(profile => {
+        const result = compatibility(me, profile);
+
+        return {
+            ...profile,
+            score: result.score,
+            reasons: result.reasons
+        };
+    });
+
+    matches.sort((a, b) => b.score - a.score);
+
+    res.json({ matches });
 });
+
 app.post('/api/report/:userId', requireAuth, (req,res) => {
  const id = Number(req.params.userId), reason = clean(req.body.reason,300);
  if (!Number.isInteger(id) || id === req.session.userId || !reason) return res.status(400).json({ error: 'Provide a valid user and reason.' });
